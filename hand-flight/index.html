@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hand Flight</title>
+<style>
+  :root {
+    --bar: #121826; --bar-2: #1c2436; --text: #e7ecf5; --muted: #8b96ab;
+    --accent: #ffb547; --ok: #3ddc84; --bad: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0f18; color: var(--text);
+    font-family: "Segoe UI", "Malgun Gothic", system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+    padding: 10px 16px; background: var(--bar); border-bottom: 1px solid #263049; font-size: 14px; }
+  button { background: var(--bar-2); color: var(--text); border: 1px solid #33405c;
+    border-radius: 8px; padding: 7px 12px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #1a1205; border-color: var(--accent); font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); display: inline-block; }
+  .dot.on { background: var(--ok); }
+  .group { display: flex; align-items: center; gap: 6px; }
+  .muted { color: var(--muted); }
+  input[type=number] { width: 58px; background: var(--bar-2); color: var(--text);
+    border: 1px solid #33405c; border-radius: 6px; padding: 5px; font: inherit; }
+  .meter { width: 90px; height: 6px; background: #2a3550; border-radius: 3px; overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0; background: var(--accent); }
+  .spacer { flex: 1; }
+  #wrap { flex: 1; display: flex; align-items: center; justify-content: center; padding: 12px; min-height: 0; }
+  canvas { width: 100%; max-height: 100%; aspect-ratio: 16 / 9; object-fit: contain;
+    border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.5); background: #000; cursor: pointer; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <button id="camBtn" class="primary">웹캠 손동작</button>
+    <button id="connect">센서 연결</button>
+    <span class="group"><span id="dot" class="dot"></span><span id="dist">-- cm</span>
+      <span class="meter"><i id="meterFill"></i></span></span>
+    <span class="group muted">입력:
+      <button id="srcBtn">마우스</button></span>
+    <span class="group muted">낮음 <input id="minCm" type="number" value="5" step="1"> cm</span>
+    <span class="group muted">높음 <input id="maxCm" type="number" value="30" step="1"> cm</span>
+    <span class="spacer"></span>
+    <button id="soundBtn">소리 켜짐</button>
+  </div>
+  <div id="wrap"><canvas id="c" width="1280" height="720"></canvas></div>
+
+<script>
+(() => {
+  const W = 1280, H = 720, GROUND = 70;
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const $ = id => document.getElementById(id);
+
+  // ---------- 저장소 (실패해도 동작) ----------
+  const store = {
+    get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+  };
+  $('minCm').value = store.get('hf.min', 5);
+  $('maxCm').value = store.get('hf.max', 30);
+  $('minCm').onchange = e => store.set('hf.min', +e.target.value);
+  $('maxCm').onchange = e => store.set('hf.max', +e.target.value);
+
+  // ---------- 입력 ----------
+  let source = 'mouse';          // 'mouse' | 'sensor'
+  let inputNorm = 0.5;           // 0 = 바닥, 1 = 천장
+  let sensorCm = null, lastSensorAt = 0;
+
+  const SRC_LABEL = { mouse: '마우스', sensor: '센서', camera: '웹캠' };
+  function setSource(s) { source = s; $('srcBtn').textContent = SRC_LABEL[s]; }
+  $('srcBtn').onclick = () => {
+    const order = ['mouse', 'sensor', 'camera'].filter(s => s !== 'camera' || cam.ready);
+    setSource(order[(order.indexOf(source) + 1) % order.length]);
+  };
+
+  // ---------- 웹캠 손 인식 (MediaPipe Hand Landmarker) ----------
+  const MP_VER = '0.10.14';
+  const cam = { ready: false, loading: false, video: null, landmarker: null,
+                hand: null, lastSeen: 0, pinch: false, lastTs: -1 };
+
+  $('camBtn').onclick = async () => {
+    if (cam.ready) { setSource('camera'); return; }
+    if (cam.loading) return;
+    cam.loading = true; $('camBtn').textContent = '불러오는 중…';
+    try {
+      const video = document.createElement('video');
+      video.playsInline = true; video.muted = true;
+      video.srcObject = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' }, audio: false });
+      await video.play();
+      const vision = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
+      const fileset = await vision.FilesetResolver.forVisionTasks(
+        `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+      const opts = (delegate) => ({
+        baseOptions: { modelAssetPath:
+          'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+          delegate },
+        runningMode: 'VIDEO', numHands: 1 });
+      try { cam.landmarker = await vision.HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+      catch { cam.landmarker = await vision.HandLandmarker.createFromOptions(fileset, opts('CPU')); }
+      cam.video = video; cam.ready = true;
+      $('camBtn').textContent = '웹캠 켜짐';
+      setSource('camera');
+      camLoop();
+    } catch (err) {
+      console.warn(err);
+      $('camBtn').textContent = '웹캠 손동작';
+      alert('웹캠을 켤 수 없어요. 카메라 권한을 허용했는지, 인터넷이 연결돼 있는지 확인해주세요.');
+    }
+    cam.loading = false;
+  };
+
+  function camLoop() {
+    const v = cam.video;
+    if (v.readyState >= 2 && v.currentTime !== cam.lastTs) {
+      cam.lastTs = v.currentTime;
+      const res = cam.landmarker.detectForVideo(v, performance.now());
+      const lm = res.landmarks && res.landmarks[0];
+      if (lm) {
+        cam.hand = lm; cam.lastSeen = performance.now();
+        // 손바닥 중심(검지·중지 뿌리 + 손목 평균) 높이 사용
+        const y = (lm[0].y + lm[5].y + lm[9].y + lm[17].y) / 4;
+        const n = clamp(1 - (y - 0.15) / 0.65, 0, 1);   // 화면 위쪽 15%~80% 범위를 사용
+        if (source === 'camera') inputNorm = n;
+        // 핀치: 엄지 끝(4)과 검지 끝(8) 거리를 손 크기(0→9)로 나눠 판정
+        const size = Math.hypot(lm[0].x - lm[9].x, lm[0].y - lm[9].y) || 1;
+        const pinchNow = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y) / size < 0.35;
+        if (pinchNow && !cam.pinch && source === 'camera') start();
+        cam.pinch = pinchNow;
+      } else if (performance.now() - cam.lastSeen > 300) {
+        cam.hand = null;
+      }
+    }
+    requestAnimationFrame(camLoop);
+  }
+
+  function drawCamPreview() {
+    if (!cam.ready || source !== 'camera') return;
+    const pw = 256, ph = 192, px = 20, py = 20;
+    ctx.save();
+    roundRect(px, py, pw, ph, 14); ctx.clip();
+    ctx.translate(px + pw, py); ctx.scale(-1, 1);            // 거울 모드
+    ctx.drawImage(cam.video, 0, 0, pw, ph);
+    if (cam.hand) {
+      ctx.fillStyle = '#ffb547';
+      for (const p of cam.hand) { ctx.beginPath(); ctx.arc(p.x * pw, p.y * ph, 3, 0, Math.PI * 2); ctx.fill(); }
+      ctx.strokeStyle = cam.pinch ? '#3ddc84' : '#fff'; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(cam.hand[4].x * pw, cam.hand[4].y * ph);
+      ctx.lineTo(cam.hand[8].x * pw, cam.hand[8].y * ph); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,255,255,.5)'; ctx.lineWidth = 2;
+    roundRect(px, py, pw, ph, 14); ctx.stroke();
+    if (!cam.hand) text('손이 안 보여요', px + pw / 2, py + ph / 2 + 10, 24, '#ff9a9a');
+  }
+
+  cv.addEventListener('mousemove', e => {
+    if (source !== 'mouse') return;
+    const r = cv.getBoundingClientRect();
+    inputNorm = clamp(1 - (e.clientY - r.top) / r.height, 0, 1);
+  });
+  cv.addEventListener('touchmove', e => {
+    if (source !== 'mouse') return;
+    const r = cv.getBoundingClientRect();
+    inputNorm = clamp(1 - (e.touches[0].clientY - r.top) / r.height, 0, 1);
+    e.preventDefault();
+  }, { passive: false });
+
+  function onSensor(cm) {
+    sensorCm = cm; lastSensorAt = performance.now();
+    const lo = +$('minCm').value, hi = +$('maxCm').value;
+    const n = clamp((cm - lo) / (hi - lo || 1), 0, 1);  // 손이 높을수록(멀수록) 위로
+    $('dist').textContent = cm.toFixed(1) + ' cm';
+    $('meterFill').style.width = (n * 100) + '%';
+    if (source === 'sensor') inputNorm = n;
+  }
+
+  // ---------- Web Serial ----------
+  let port = null;
+  $('connect').onclick = async () => {
+    if (!('serial' in navigator)) {
+      alert('이 브라우저는 Web Serial을 지원하지 않아요. Chrome 또는 Edge에서 열어주세요.');
+      return;
+    }
+    try {
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 115200 });
+      $('dot').classList.add('on');
+      $('connect').textContent = '연결됨';
+      setSource('sensor');
+      readLoop();
+    } catch (err) { console.warn(err); }
+  };
+  async function readLoop() {
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable).catch(() => {});
+    const reader = decoder.readable.getReader();
+    let buf = '';
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const v = parseFloat(buf.slice(0, i)); buf = buf.slice(i + 1);
+          if (!isNaN(v)) onSensor(v);
+        }
+      }
+    } catch (e) { console.warn(e); }
+    $('dot').classList.remove('on'); $('connect').textContent = '센서 연결';
+  }
+
+  // ---------- 사운드 ----------
+  let soundOn = store.get('hf.sound', true), actx = null;
+  $('soundBtn').textContent = soundOn ? '소리 켜짐' : '소리 꺼짐';
+  $('soundBtn').onclick = () => { soundOn = !soundOn; store.set('hf.sound', soundOn);
+    $('soundBtn').textContent = soundOn ? '소리 켜짐' : '소리 꺼짐'; };
+  function beep(freq, dur = 0.08, type = 'sine', vol = 0.12) {
+    if (!soundOn) return;
+    try {
+      actx = actx || new AudioContext();
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+      o.connect(g).connect(actx.destination); o.start(); o.stop(actx.currentTime + dur);
+    } catch {}
+  }
+
+  // ---------- 게임 상태 ----------
+  const plane = { x: 300, y: H / 2, vy: 0, r: 20 };
+  let pillars = [], particles = [], score = 0, best = store.get('hf.best', 0);
+  let state = 'ready', distTravelled = 0, nextPillarAt = 0, shake = 0, t = 0;
+
+  const speedMul = () => 1 + Math.floor(score / 7) * 0.1;
+  const playTop = 20, playBottom = H - GROUND - 20;
+
+  function reset() {
+    pillars = []; particles = []; score = 0; distTravelled = 0; nextPillarAt = 500;
+    plane.y = targetY(); plane.vy = 0; state = 'playing';
+  }
+  function targetY() { return playBottom - inputNorm * (playBottom - playTop); }
+
+  function spawnPillar() {
+    const gap = Math.max(190, 260 - score * 2.5);
+    const margin = 70;
+    const gy = margin + Math.random() * (H - GROUND - margin * 2 - gap);
+    pillars.push({ x: W + 60, w: 96, gapY: gy, gap, passed: false, seed: Math.random() * 1000 });
+  }
+
+  function start() {
+    if (state === 'ready' || state === 'over') { reset(); beep(520, 0.1, 'triangle'); }
+  }
+  cv.addEventListener('click', start);
+  window.addEventListener('keydown', e => { if (e.code === 'Space' || e.code === 'Enter') { e.preventDefault(); start(); } });
+
+  // 센서 모드에선 손을 최하단까지 내렸다 올리면 재시작
+  let lowHold = 0;
+
+  // ---------- 업데이트 ----------
+  function update(dt) {
+    t += dt;
+    const sp = 260 * speedMul();
+
+    // 비행기: 입력 높이를 부드럽게 따라감
+    const ty = targetY();
+    const prevY = plane.y;
+    plane.y += (ty - plane.y) * (1 - Math.pow(0.0008, dt));
+    plane.vy = (plane.y - prevY) / Math.max(dt, 1e-3);
+
+    // 센서 모드: 손을 0.5초 이상 바닥까지 내렸다가(arm) 위로 올리면 시작
+    if (state !== 'playing' && source === 'sensor') {
+      if (inputNorm < 0.08) lowHold += dt; else if (lowHold < 0.5) lowHold = 0;
+      if (lowHold >= 0.5 && inputNorm > 0.5) { lowHold = 0; start(); }
+    }
+
+    if (state === 'playing') {
+      distTravelled += sp * dt;
+      if (distTravelled >= nextPillarAt) { spawnPillar(); nextPillarAt = distTravelled + 420 + Math.random() * 80; }
+      for (const p of pillars) {
+        p.x -= sp * dt;
+        if (!p.passed && p.x + p.w < plane.x) { p.passed = true; score++; beep(880 + (score % 5) * 60, 0.07); }
+      }
+      pillars = pillars.filter(p => p.x > -150);
+
+      // 충돌
+      const hit = pillars.some(p => circleRect(plane.x, plane.y, plane.r - 4, p.x, 0, p.w, p.gapY) ||
+                                    circleRect(plane.x, plane.y, plane.r - 4, p.x, p.gapY + p.gap, p.w, H));
+      if (hit || plane.y > H - GROUND - 8) gameOver();
+
+      // 비행운
+      particles.push({ x: plane.x - 22, y: plane.y + 4, life: 0.6, vx: -sp * 0.5 });
+    }
+    for (const q of particles) { q.x += q.vx * dt; q.life -= dt; }
+    particles = particles.filter(q => q.life > 0);
+    shake = Math.max(0, shake - dt * 30);
+  }
+
+  function gameOver() {
+    state = 'over'; shake = 12;
+    if (score > best) { best = score; store.set('hf.best', best); }
+    beep(160, 0.35, 'sawtooth', 0.15);
+  }
+
+  function circleRect(cx, cy, r, rx, ry, rw, rh) {
+    const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
+    return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
+  }
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  // ---------- 그리기 ----------
+  function drawSky() {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#2b1e4f'); g.addColorStop(0.45, '#c2577a'); g.addColorStop(0.8, '#ffb36b');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    // 해
+    const sg = ctx.createRadialGradient(980, 470, 10, 980, 470, 160);
+    sg.addColorStop(0, 'rgba(255,240,200,1)'); sg.addColorStop(0.3, 'rgba(255,210,150,.6)'); sg.addColorStop(1, 'rgba(255,180,120,0)');
+    ctx.fillStyle = sg; ctx.fillRect(800, 300, 360, 340);
+    // 별
+    ctx.fillStyle = 'rgba(255,255,255,.7)';
+    for (let i = 0; i < 40; i++) {
+      const x = (i * 197.3) % W, y = (i * 83.7) % 220;
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(t * 1.5 + i));
+      ctx.fillRect(x, y, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function drawHills(offset, color, amp, base, freq) {
+    ctx.fillStyle = color; ctx.beginPath(); ctx.moveTo(0, H);
+    for (let x = 0; x <= W; x += 16) {
+      const wx = x + offset;
+      ctx.lineTo(x, base - amp * (Math.sin(wx * freq) * 0.6 + Math.sin(wx * freq * 2.3 + 1) * 0.4));
+    }
+    ctx.lineTo(W, H); ctx.fill();
+  }
+  function drawPillar(p) {
+    const drawPart = (y, h, cap) => {
+      const g = ctx.createLinearGradient(p.x, 0, p.x + p.w, 0);
+      g.addColorStop(0, '#5b4a5e'); g.addColorStop(0.45, '#8a7488'); g.addColorStop(1, '#3d3042');
+      ctx.fillStyle = g; ctx.fillRect(p.x, y, p.w, h);
+      // 돌 무늬
+      ctx.strokeStyle = 'rgba(0,0,0,.18)'; ctx.lineWidth = 2;
+      for (let yy = y + 40; yy < y + h; yy += 46) {
+        ctx.beginPath(); ctx.moveTo(p.x, yy); ctx.lineTo(p.x + p.w, yy); ctx.stroke();
+        const off = ((Math.floor(yy / 46) + Math.floor(p.seed)) % 2) * 40 + 20;
+        ctx.beginPath(); ctx.moveTo(p.x + off, yy - 46); ctx.lineTo(p.x + off, yy); ctx.stroke();
+      }
+      // 끝부분 장식 (빛나는 크리스탈 띠)
+      const cy = cap === 'bottom' ? y + h - 22 : y;
+      ctx.fillStyle = '#2f2533'; ctx.fillRect(p.x - 8, cy, p.w + 16, 22);
+      ctx.fillStyle = `hsl(${185 + Math.sin(t * 3 + p.seed) * 15},90%,65%)`;
+      ctx.fillRect(p.x - 2, cy + 8, p.w + 4, 6);
+    };
+    drawPart(0, p.gapY, 'bottom');
+    drawPart(p.gapY + p.gap, H - GROUND - (p.gapY + p.gap), 'top');
+  }
+  function drawPlane() {
+    for (const q of particles) {
+      ctx.fillStyle = `rgba(255,255,255,${q.life * 0.5})`;
+      ctx.beginPath(); ctx.arc(q.x, q.y, 3 * q.life + 1, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(plane.x, plane.y);
+    ctx.rotate(clamp(plane.vy / 900, -0.6, 0.6));
+    // 종이비행기
+    ctx.fillStyle = '#ffffff'; ctx.strokeStyle = '#3a2d4a'; ctx.lineWidth = 2.5; ctx.lineJoin = 'round';
+    ctx.beginPath(); ctx.moveTo(30, 0); ctx.lineTo(-26, -18); ctx.lineTo(-14, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#d9dcef';
+    ctx.beginPath(); ctx.moveTo(30, 0); ctx.lineTo(-14, 0); ctx.lineTo(-22, 16); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#ffb547';
+    ctx.beginPath(); ctx.moveTo(30, 0); ctx.lineTo(-14, 0); ctx.lineTo(-8, 5); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function drawGround(offset) {
+    ctx.fillStyle = '#2a1f33'; ctx.fillRect(0, H - GROUND, W, GROUND);
+    ctx.fillStyle = '#4b3a55'; ctx.fillRect(0, H - GROUND, W, 8);
+    ctx.fillStyle = 'rgba(255,255,255,.06)';
+    for (let x = -(offset % 60); x < W; x += 60) ctx.fillRect(x, H - GROUND + 20, 30, 6);
+  }
+  function text(str, x, y, size, color = '#fff', align = 'center') {
+    ctx.font = `800 ${size}px "Segoe UI", "Malgun Gothic", sans-serif`;
+    ctx.textAlign = align; ctx.lineWidth = size / 7; ctx.strokeStyle = 'rgba(30,15,40,.85)';
+    ctx.strokeText(str, x, y); ctx.fillStyle = color; ctx.fillText(str, x, y);
+  }
+  function panel(lines) {
+    ctx.fillStyle = 'rgba(20,14,30,.72)';
+    const w = 560, h = 70 + lines.length * 52;
+    roundRect(W / 2 - w / 2, H / 2 - h / 2, w, h, 22); ctx.fill();
+    lines.forEach((l, i) => text(l[0], W / 2, H / 2 - h / 2 + 70 + i * 52, l[1], l[2]));
+  }
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random() - .5) * shake, (Math.random() - .5) * shake);
+    drawSky();
+    drawHills(distTravelled * 0.15 + t * 10, '#7d3f6b', 70, H - 170, 0.004);
+    drawHills(distTravelled * 0.35 + t * 20, '#4e2a52', 50, H - 110, 0.007);
+    pillars.forEach(drawPillar);
+    drawGround(distTravelled + t * 60);
+    drawPlane();
+
+    if (state === 'playing' || state === 'over') {
+      text(String(score), W / 2, 110, 84);
+      text(`속도 ${speedMul().toFixed(1)}x`, W / 2, 150, 26, '#ffd27a');
+    }
+    const how = source === 'sensor' ? '손을 끝까지 내렸다가 올리면 시작'
+              : source === 'camera' ? '엄지와 검지를 붙이면(핀치) 시작'
+              : '클릭 또는 스페이스로 시작';
+    drawCamPreview();
+    if (state === 'ready') {
+      panel([['HAND FLIGHT', 60, '#ffd27a'], ['손 높이로 비행기를 조종하세요', 26], [how, 24, '#c9d2e6']]);
+    } else if (state === 'over') {
+      panel([['게임 오버', 56, '#ff7a7a'], [`점수 ${score}    최고 ${best}`, 32], [how, 24, '#c9d2e6']]);
+    }
+    if (source === 'sensor' && performance.now() - lastSensorAt > 1500) {
+      text('센서 데이터 없음', W - 20, 40, 22, '#ff9a9a', 'right');
+    }
+    ctx.restore();
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    update(dt); draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
